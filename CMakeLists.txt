@@ -1,18 +1,16 @@
-cmake_minimum_required(VERSION 3.28...3.30)
-
-include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
-
+cmake_minimum_required(VERSION 3.16)
 project(obs-companion-bridge VERSION 1.0.0)
 
-option(ENABLE_FRONTEND_API "Use obs-frontend-api for UI functionality" OFF)
-option(ENABLE_QT "Use Qt functionality" OFF)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-include(compilerconfig)
-include(defaults)
-include(helpers)
+# ─── OBS Plugin boilerplate ───────────────────────────────────────────────────
+# Uses obs-plugintemplate conventions.
+# The template automatically downloads the OBS SDK via buildspec.json.
 
+find_package(libobs REQUIRED)
 
-# nlohmann/json (auto-downloaded, header-only)
+# ─── nlohmann/json (header-only, fetched automatically) ──────────────────────
 include(FetchContent)
 FetchContent_Declare(
   nlohmann_json
@@ -22,34 +20,89 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
-add_library(${CMAKE_PROJECT_NAME} MODULE)
-
-find_package(libobs REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::libobs
-  OBS::obs-frontend-api
-  nlohmann_json::nlohmann_json)
-
-if(ENABLE_FRONTEND_API)
-  find_package(obs-frontend-api REQUIRED)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
-endif()
-
-if(ENABLE_QT)
-  find_package(Qt6 COMPONENTS Widgets Core)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Qt6::Core Qt6::Widgets)
-  target_compile_options(
-    ${CMAKE_PROJECT_NAME}
-    PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
-  )
-  set_target_properties(
-    ${CMAKE_PROJECT_NAME}
-    PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
-  )
-endif()
-
-target_sources(${CMAKE_PROJECT_NAME} PRIVATE
+# ─── Plugin target ────────────────────────────────────────────────────────────
+add_library(obs-companion-bridge MODULE
   src/plugin-main.cpp
   src/companion-bridge.cpp
 )
 
-set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
+target_include_directories(obs-companion-bridge PRIVATE
+  src/
+  ${nlohmann_json_SOURCE_DIR}/include
+)
+
+# ─── Core libs (all platforms) ───────────────────────────────────────────────
+target_link_libraries(obs-companion-bridge PRIVATE
+  OBS::libobs
+  nlohmann_json::nlohmann_json
+)
+
+# ─── obs-frontend-api (only available in full OBS builds) ────────────────────
+# The macOS CI builds OBS in headless mode, so this target may not exist there.
+if(TARGET OBS::obs-frontend-api)
+  target_link_libraries(obs-companion-bridge PRIVATE OBS::obs-frontend-api)
+endif()
+
+# ─── Windows-only socket and DNS libs ────────────────────────────────────────
+# ws2_32 = WinSock2 (HTTP server), dnsapi = Windows DNS-SD (mDNS advertiser)
+# These don't exist on macOS/Linux — the platform headers handle their own APIs.
+if(WIN32)
+  target_link_libraries(obs-companion-bridge PRIVATE
+    ws2_32
+    dnsapi
+  )
+endif()
+
+# ─── macOS-only frameworks ───────────────────────────────────────────────────
+# dns_sd is part of the system on macOS — no extra install needed.
+if(APPLE)
+  target_link_libraries(obs-companion-bridge PRIVATE
+    "-framework CoreFoundation"
+    "-framework SystemConfiguration"
+  )
+endif()
+
+# ─── Compiler definitions ────────────────────────────────────────────────────
+target_compile_definitions(obs-companion-bridge PRIVATE
+  PLUGIN_VERSION="${PROJECT_VERSION}"
+)
+
+# ─── MSVC-specific flags ──────────────────────────────────────────────────────
+if(MSVC)
+  target_compile_options(obs-companion-bridge PRIVATE
+    /W3
+    /WX-
+    /MP
+    /utf-8
+  )
+  target_compile_definitions(obs-companion-bridge PRIVATE
+    _CRT_SECURE_NO_WARNINGS
+    WIN32_LEAN_AND_MEAN
+    NOMINMAX
+  )
+endif()
+
+# ─── Output name ─────────────────────────────────────────────────────────────
+set_target_properties(obs-companion-bridge PROPERTIES
+  PREFIX ""
+)
+
+# ─── Install paths ────────────────────────────────────────────────────────────
+if(WIN32)
+  install(TARGETS obs-companion-bridge
+    LIBRARY DESTINATION "obs-plugins/64bit"
+    RUNTIME DESTINATION "obs-plugins/64bit"
+  )
+  install(DIRECTORY data/
+    DESTINATION "data/obs-plugins/obs-companion-bridge"
+    OPTIONAL
+  )
+elseif(APPLE)
+  install(TARGETS obs-companion-bridge
+    LIBRARY DESTINATION "obs-plugins"
+  )
+  install(DIRECTORY data/
+    DESTINATION "data/obs-plugins/obs-companion-bridge"
+    OPTIONAL
+  )
+endif()
