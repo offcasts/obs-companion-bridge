@@ -4,6 +4,7 @@
 #include "mdns-advertiser.hpp"
 
 #include <obs-module.h>
+#include <obs-websocket-api.h>
 #include <util/platform.h>
 
 #ifdef ENABLE_FRONTEND_API
@@ -208,6 +209,9 @@ void CompanionBridge::HandleVendorRequest(const std::string &requestType,
 					  obs_data_t *requestData,
 					  obs_data_t *responseData)
 {
+	// requestData is intentionally unused for these read-only requests
+	(void)requestData;
+
 	if (requestType == "GetConnectionInfo") {
 		WebSocketCredentials creds = GetCurrentCredentials();
 		obs_data_set_string(responseData, "host",
@@ -234,7 +238,6 @@ void CompanionBridge::ReadWebSocketSettings()
 {
 	std::lock_guard<std::mutex> lock(m_credentialsMutex);
 
-	// Default fallback values
 	m_credentials.host = "127.0.0.1";
 	m_credentials.port = 4455;
 	m_credentials.authEnabled = false;
@@ -267,8 +270,9 @@ WebSocketCredentials CompanionBridge::GetCurrentCredentials()
 	return m_credentials;
 }
 
-void CompanionBridge::OnCompanionConnected(
-	const std::string &host, int port, const std::string &moduleLabel)
+void CompanionBridge::OnCompanionConnected(const std::string &host,
+					   int port,
+					   const std::string &moduleLabel)
 {
 	{
 		std::lock_guard<std::mutex> lock(m_statusMutex);
@@ -334,8 +338,11 @@ void CompanionBridge::UpdateDockStatus()
 	obs_data_set_int(eventData, "companionPort",
 			 status.companionPort);
 	obs_data_set_string(eventData, "pluginVersion", PLUGIN_VERSION);
-	obs_websocket_vendor_emit_event(
-		obs_websocket_register_vendor(VENDOR_NAME), "StatusChanged",
-		eventData);
+
+	auto vendor = obs_websocket_register_vendor(VENDOR_NAME);
+	if (vendor)
+		obs_websocket_vendor_emit_event(vendor, "StatusChanged",
+						eventData);
+
 	obs_data_release(eventData);
 }
