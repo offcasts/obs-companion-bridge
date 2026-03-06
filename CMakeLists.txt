@@ -1,7 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
 # ─── obs-plugintemplate bootstrap ────────────────────────────────────────────
-# MUST come before project() — sets CMAKE_PREFIX_PATH so find_package works.
 include("${CMAKE_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
 project(obs-companion-bridge VERSION 1.0.0)
@@ -14,7 +13,7 @@ include(compilerconfig)
 include(defaults)
 include(helpers)
 
-# ─── Find OBS packages (bootstrap set the prefix path, now we import them) ───
+# ─── Find OBS packages ────────────────────────────────────────────────────────
 find_package(libobs REQUIRED)
 
 if(ENABLE_FRONTEND_API)
@@ -31,6 +30,21 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(nlohmann_json)
 
+# ─── Linux: Avahi dns_sd compatibility (optional — graceful fallback) ────────
+if(UNIX AND NOT APPLE)
+  find_library(AVAHI_COMPAT_LIB avahi-compat-libdns_sd
+    HINTS /usr/lib /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu)
+  find_path(AVAHI_COMPAT_INCLUDE_DIR dns_sd.h
+    HINTS /usr/include/avahi-compat-libdns_sd)
+  if(AVAHI_COMPAT_LIB AND AVAHI_COMPAT_INCLUDE_DIR)
+    message(STATUS "Found Avahi dns_sd compat: ${AVAHI_COMPAT_LIB}")
+    set(HAVE_AVAHI_COMPAT TRUE)
+  else()
+    message(STATUS "Avahi dns_sd compat not found — mDNS disabled on Linux")
+    set(HAVE_AVAHI_COMPAT FALSE)
+  endif()
+endif()
+
 # ─── Plugin target ────────────────────────────────────────────────────────────
 add_library(${CMAKE_PROJECT_NAME} MODULE)
 
@@ -44,13 +58,12 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
   ${nlohmann_json_SOURCE_DIR}/include
 )
 
-# ─── Link OBS::libobs (always available after find_package above) ─────────────
+# ─── Core OBS link ────────────────────────────────────────────────────────────
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
   OBS::libobs
   nlohmann_json::nlohmann_json
 )
 
-# ─── obs-frontend-api (only in full OBS builds, not headless CI) ──────────────
 if(ENABLE_FRONTEND_API AND TARGET OBS::obs-frontend-api)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
   target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE ENABLE_FRONTEND_API)
@@ -58,17 +71,22 @@ endif()
 
 # ─── Platform-specific libraries ─────────────────────────────────────────────
 if(WIN32)
-  # WinSock2 = HTTP server, dnsapi = Windows mDNS
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 dnsapi)
 elseif(APPLE)
-  # dns_sd (Bonjour) is built into macOS — just need these frameworks
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     "-framework CoreFoundation"
     "-framework SystemConfiguration"
   )
+elseif(UNIX)
+  if(HAVE_AVAHI_COMPAT)
+    target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
+      ${AVAHI_COMPAT_INCLUDE_DIR})
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
+      ${AVAHI_COMPAT_LIB})
+  endif()
 endif()
 
-# ─── Version definition ───────────────────────────────────────────────────────
+# ─── Version ─────────────────────────────────────────────────────────────────
 target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
   PLUGIN_VERSION="${PROJECT_VERSION}"
 )
