@@ -1,8 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 # ─── obs-plugintemplate bootstrap ────────────────────────────────────────────
-# MUST come before project() — this sets up the OBS SDK paths so that
-# find_package(libobs) and find_package(obs-frontend-api) work correctly.
+# MUST come before project() — sets CMAKE_PREFIX_PATH so find_package works.
 include("${CMAKE_SOURCE_DIR}/cmake/common/bootstrap.cmake" NO_POLICY_SCOPE)
 
 project(obs-companion-bridge VERSION 1.0.0)
@@ -14,6 +13,13 @@ option(ENABLE_QT "Use Qt functionality" OFF)
 include(compilerconfig)
 include(defaults)
 include(helpers)
+
+# ─── Find OBS packages (bootstrap set the prefix path, now we import them) ───
+find_package(libobs REQUIRED)
+
+if(ENABLE_FRONTEND_API)
+  find_package(obs-frontend-api QUIET)
+endif()
 
 # ─── nlohmann/json (header-only, auto-downloaded) ────────────────────────────
 include(FetchContent)
@@ -38,27 +44,24 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
   ${nlohmann_json_SOURCE_DIR}/include
 )
 
-# ─── Link OBS libraries ───────────────────────────────────────────────────────
+# ─── Link OBS::libobs (always available after find_package above) ─────────────
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
   OBS::libobs
   nlohmann_json::nlohmann_json
 )
 
-# obs-frontend-api only exists in full (non-headless) OBS builds
-if(ENABLE_FRONTEND_API)
-  find_package(obs-frontend-api QUIET)
-  if(TARGET OBS::obs-frontend-api)
-    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
-    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE ENABLE_FRONTEND_API)
-  endif()
+# ─── obs-frontend-api (only in full OBS builds, not headless CI) ──────────────
+if(ENABLE_FRONTEND_API AND TARGET OBS::obs-frontend-api)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OBS::obs-frontend-api)
+  target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE ENABLE_FRONTEND_API)
 endif()
 
 # ─── Platform-specific libraries ─────────────────────────────────────────────
 if(WIN32)
-  # WinSock2 for HTTP server, Windows DNS-SD for mDNS
+  # WinSock2 = HTTP server, dnsapi = Windows mDNS
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 dnsapi)
 elseif(APPLE)
-  # Bonjour / dns_sd is part of the macOS system — no extra install needed
+  # dns_sd (Bonjour) is built into macOS — just need these frameworks
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     "-framework CoreFoundation"
     "-framework SystemConfiguration"
@@ -71,5 +74,4 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
 )
 
 # ─── Template finalisation ────────────────────────────────────────────────────
-# set_target_properties_plugin wires up install paths, code signing, etc.
 set_target_properties_plugin(${CMAKE_PROJECT_NAME} PROPERTIES OUTPUT_NAME ${_name})
