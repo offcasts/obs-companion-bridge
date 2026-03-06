@@ -1,40 +1,59 @@
 #include "plugin-main.hpp"
 #include "companion-bridge.hpp"
 #include <obs-module.h>
-#include <obs-frontend-api.h>
 #include <util/platform.h>
+
+#ifdef ENABLE_FRONTEND_API
+#include <obs-frontend-api.h>
+#endif
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-companion-bridge", "en-US")
 
 static CompanionBridge *g_bridge = nullptr;
 
+#ifdef ENABLE_FRONTEND_API
 static void on_frontend_event(enum obs_frontend_event event, void *)
 {
 	switch (event) {
 	case OBS_FRONTEND_EVENT_FINISHED_LOADING:
-		if (g_bridge) g_bridge->OnOBSLoaded();
+		if (g_bridge)
+			g_bridge->OnOBSLoaded();
 		break;
 	case OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN:
 	case OBS_FRONTEND_EVENT_EXIT:
-		if (g_bridge) g_bridge->Shutdown();
+		if (g_bridge)
+			g_bridge->Shutdown();
 		break;
 	default:
 		break;
 	}
 }
+#endif
 
 bool obs_module_load()
 {
-	blog(LOG_INFO, "[obs-companion-bridge] Loading plugin v%s", PLUGIN_VERSION);
+	blog(LOG_INFO, "[obs-companion-bridge] Loading plugin v%s",
+	     PLUGIN_VERSION);
+
 	g_bridge = new CompanionBridge();
+
 	if (!g_bridge->Initialize()) {
-		blog(LOG_ERROR, "[obs-companion-bridge] Failed to initialize bridge");
+		blog(LOG_ERROR,
+		     "[obs-companion-bridge] Failed to initialize bridge");
 		delete g_bridge;
 		g_bridge = nullptr;
 		return false;
 	}
+
+#ifdef ENABLE_FRONTEND_API
 	obs_frontend_add_event_callback(on_frontend_event, nullptr);
+#else
+	// No frontend API — call OnOBSLoaded immediately since we won't
+	// receive the FINISHED_LOADING event.
+	g_bridge->OnOBSLoaded();
+#endif
+
 	blog(LOG_INFO, "[obs-companion-bridge] Plugin loaded successfully");
 	return true;
 }
@@ -42,12 +61,17 @@ bool obs_module_load()
 void obs_module_unload()
 {
 	blog(LOG_INFO, "[obs-companion-bridge] Unloading plugin");
+
+#ifdef ENABLE_FRONTEND_API
 	obs_frontend_remove_event_callback(on_frontend_event, nullptr);
+#endif
+
 	if (g_bridge) {
 		g_bridge->Shutdown();
 		delete g_bridge;
 		g_bridge = nullptr;
 	}
+
 	blog(LOG_INFO, "[obs-companion-bridge] Plugin unloaded");
 }
 
