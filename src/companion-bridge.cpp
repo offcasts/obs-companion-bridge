@@ -4,7 +4,7 @@
 #include "mdns-advertiser.hpp"
 
 #include <obs-module.h>
-#include <obs-websocket-api.h>
+#include "obs-websocket-api.h"
 #include <util/platform.h>
 
 #ifdef ENABLE_FRONTEND_API
