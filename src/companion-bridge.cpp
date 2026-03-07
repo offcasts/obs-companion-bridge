@@ -394,39 +394,97 @@ void CompanionBridge::ReadWebSocketSettings()
 	}
 #endif
 
-	// Headless / Windows plugin build — read global.ini directly
+	// Headless / Windows plugin build — two-stage credential read:
+	//
+	// Stage 1: obs-websocket standalone stores config in:
+	//   <obs-config>/plugin_config/obs-websocket/config.json
+	// This takes priority because it contains the real runtime password.
+	//
+	// Stage 2: Bundled obs-websocket (OBS 28+) stores config in global.ini
+	// under [OBSWebSocket]. Used as fallback.
+
+	std::string obsConfigDir;
 	std::string iniPath = GetOBSConfigPath();
-	if (iniPath.empty()) {
-		blog(LOG_WARNING,
-		     "[obs-companion-bridge] Could not determine OBS config path");
-		return;
+
+	// Derive config dir from ini path (strip filename)
+	if (!iniPath.empty()) {
+		size_t sep = iniPath.find_last_of("/\\");
+		if (sep != std::string::npos)
+			obsConfigDir = iniPath.substr(0, sep);
 	}
 
-	std::string portStr =
-		ReadIniValue(iniPath, "OBSWebSocket", "ServerPort");
-	std::string authStr =
-		ReadIniValue(iniPath, "OBSWebSocket", "AuthRequired");
-	std::string passStr =
-		ReadIniValue(iniPath, "OBSWebSocket", "ServerPassword");
+	// ── Stage 1: plugin_config/obs-websocket/config.json ─────────────────
+	bool foundInJson = false;
+	if (!obsConfigDir.empty()) {
+#if defined(_WIN32)
+		std::string jsonPath = obsConfigDir +
+				       "\\plugin_config\\obs-websocket\\config.json";
+#else
+		std::string jsonPath = obsConfigDir +
+				       "/plugin_config/obs-websocket/config.json";
+#endif
+		std::ifstream jf(jsonPath);
+		if (jf.is_open()) {
+			try {
+				std::string content((std::istreambuf_iterator<char>(jf)),
+						    std::istreambuf_iterator<char>());
+				auto cfg = json::parse(content);
 
-	if (!portStr.empty()) {
-		int p = std::stoi(portStr);
-		if (p > 0)
-			m_credentials.port = p;
+				if (cfg.contains("server_port") &&
+				    cfg["server_port"].is_number()) {
+					int p = cfg["server_port"].get<int>();
+					if (p > 0)
+						m_credentials.port = p;
+				}
+				if (cfg.contains("auth_required") &&
+				    cfg["auth_required"].is_boolean()) {
+					m_credentials.authEnabled =
+						cfg["auth_required"].get<bool>();
+				}
+				if (m_credentials.authEnabled &&
+				    cfg.contains("server_password") &&
+				    cfg["server_password"].is_string()) {
+					m_credentials.password =
+						cfg["server_password"].get<std::string>();
+				}
+				foundInJson = true;
+				blog(LOG_INFO,
+				     "[obs-companion-bridge] Credentials from config.json — "
+				     "path=%s port=%d auth=%s",
+				     jsonPath.c_str(), m_credentials.port,
+				     m_credentials.authEnabled ? "yes" : "no");
+			} catch (...) {
+				blog(LOG_WARNING,
+				     "[obs-companion-bridge] Failed to parse obs-websocket config.json");
+			}
+		}
 	}
 
-	// INI booleans from OBS are stored as "true"/"false"
-	m_credentials.authEnabled =
-		(authStr == "true" || authStr == "1");
+	// ── Stage 2: global.ini fallback ─────────────────────────────────────
+	if (!foundInJson && !iniPath.empty()) {
+		std::string portStr =
+			ReadIniValue(iniPath, "OBSWebSocket", "ServerPort");
+		std::string authStr =
+			ReadIniValue(iniPath, "OBSWebSocket", "AuthRequired");
+		std::string passStr =
+			ReadIniValue(iniPath, "OBSWebSocket", "ServerPassword");
 
-	if (m_credentials.authEnabled && !passStr.empty())
-		m_credentials.password = passStr;
+		if (!portStr.empty()) {
+			int p = std::stoi(portStr);
+			if (p > 0)
+				m_credentials.port = p;
+		}
+		m_credentials.authEnabled =
+			(authStr == "true" || authStr == "1");
+		if (m_credentials.authEnabled && !passStr.empty())
+			m_credentials.password = passStr;
 
-	blog(LOG_INFO,
-	     "[obs-companion-bridge] Credentials from global.ini — "
-	     "path=%s port=%d auth=%s",
-	     iniPath.c_str(), m_credentials.port,
-	     m_credentials.authEnabled ? "yes" : "no");
+		blog(LOG_INFO,
+		     "[obs-companion-bridge] Credentials from global.ini — "
+		     "path=%s port=%d auth=%s",
+		     iniPath.c_str(), m_credentials.port,
+		     m_credentials.authEnabled ? "yes" : "no");
+	}
 }
 
 WebSocketCredentials CompanionBridge::GetCurrentCredentials()
