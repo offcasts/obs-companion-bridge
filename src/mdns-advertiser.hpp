@@ -6,8 +6,7 @@
  *   Windows → DnsServiceRegister (dnsapi, built-in since Win10 1809)
  *   macOS   → dns_sd / DNSServiceRegister (Bonjour, built into macOS)
  *   Linux   → Avahi dns_sd compatibility layer (libavahi-compat-libdnssd-dev)
- *             Falls back to a no-op stub if Avahi is not installed,
- *             so the plugin still loads — mDNS just won't advertise.
+ *             Falls back to a no-op stub if Avahi is not installed.
  */
 
 #include <string>
@@ -16,14 +15,14 @@
 #include <cstring>
 
 struct MdnsServiceInfo {
-	std::string serviceType;  // e.g. "_obs-companion._tcp"
-	std::string serviceName;  // e.g. "OBS Companion Bridge"
+	std::string serviceType;
+	std::string serviceName;
 	int port;
 	std::unordered_map<std::string, std::string> txtRecords;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Windows implementation — DnsServiceRegister (dnsapi.lib)
+// Windows — DnsServiceRegister (dnsapi.lib)
 // ─────────────────────────────────────────────────────────────────────────────
 #if defined(_WIN32)
 
@@ -41,42 +40,47 @@ public:
 
 	bool Register(const MdnsServiceInfo &info)
 	{
-		m_info = info;
 		m_instanceName =
 			info.serviceName + "." + info.serviceType + ".local";
-		std::wstring wName(m_instanceName.begin(),
-				   m_instanceName.end());
+		m_wInstanceName = std::wstring(m_instanceName.begin(),
+					       m_instanceName.end());
 
-		std::vector<std::wstring> keys, vals;
-		std::vector<LPWSTR> kptrs, vptrs;
+		// Build TXT key/value arrays (must outlive the Register call)
 		for (auto &[k, v] : info.txtRecords) {
-			keys.push_back(std::wstring(k.begin(), k.end()));
-			vals.push_back(std::wstring(v.begin(), v.end()));
+			m_keys.push_back(
+				std::wstring(k.begin(), k.end()));
+			m_vals.push_back(
+				std::wstring(v.begin(), v.end()));
 		}
-		for (size_t i = 0; i < keys.size(); i++) {
-			kptrs.push_back(
-				const_cast<LPWSTR>(keys[i].c_str()));
-			vptrs.push_back(
-				const_cast<LPWSTR>(vals[i].c_str()));
+		for (size_t i = 0; i < m_keys.size(); ++i) {
+			m_kptrs.push_back(
+				const_cast<PWSTR>(m_keys[i].c_str()));
+			m_vptrs.push_back(
+				const_cast<PWSTR>(m_vals[i].c_str()));
 		}
 
-		DNS_SERVICE_INSTANCE si = {};
-		si.pszInstanceName =
-			const_cast<LPWSTR>(wName.c_str());
-		si.wPort = (WORD)info.port;
-		si.dwPropertyCount = (DWORD)info.txtRecords.size();
-		si.keys = si.dwPropertyCount > 0 ? kptrs.data() : nullptr;
-		si.values =
-			si.dwPropertyCount > 0 ? vptrs.data() : nullptr;
+		// Service instance (storage lives in this object)
+		m_instance = {};
+		m_instance.pszInstanceName =
+			const_cast<PWSTR>(m_wInstanceName.c_str());
+		m_instance.wPort = (WORD)info.port;
+		m_instance.dwPropertyCount = (DWORD)m_keys.size();
+		m_instance.keys =
+			m_kptrs.empty() ? nullptr : m_kptrs.data();
+		m_instance.values =
+			m_vptrs.empty() ? nullptr : m_vptrs.data();
 
-		DNS_SERVICE_REGISTER_REQUEST req = {};
-		req.Version = DNS_QUERY_REQUEST_VERSION1;
-		req.pServiceInstance = &si;
-		req.pRegisterCompletionCallback = RegisterCb;
-		req.pQueryContext = this;
-		req.unicastEnabled = FALSE;
+		// Register request — we keep this so Unregister can pass it
+		// to DnsServiceDeRegister (which requires the original request,
+		// not the cancel handle).
+		m_request = {};
+		m_request.Version = DNS_QUERY_REQUEST_VERSION1;
+		m_request.pServiceInstance = &m_instance;
+		m_request.pRegisterCompletionCallback = RegisterCb;
+		m_request.pQueryContext = this;
+		m_request.unicastEnabled = FALSE;
 
-		DWORD result = DnsServiceRegister(&req, &m_cancel);
+		DWORD result = DnsServiceRegister(&m_request, &m_cancel);
 		m_registered =
 			(result == DNS_REQUEST_PENDING ||
 			 result == ERROR_SUCCESS);
@@ -85,35 +89,38 @@ public:
 
 	void Unregister()
 	{
-		if (m_registered) {
-			m_registered = false;
-			DnsServiceDeRegister(&m_cancel, nullptr);
-		}
+		if (!m_registered)
+			return;
+		m_registered = false;
+		// DnsServiceDeRegister takes PDNS_SERVICE_REGISTER_REQUEST,
+		// NOT PDNS_SERVICE_CANCEL — we pass the original request.
+		DnsServiceDeRegister(&m_request, nullptr);
 	}
 
 private:
 	static VOID WINAPI RegisterCb(DWORD, PVOID,
 				      PDNS_SERVICE_INSTANCE) {}
 
-	MdnsServiceInfo m_info;
 	std::string m_instanceName;
+	std::wstring m_wInstanceName;
+	std::vector<std::wstring> m_keys, m_vals;
+	std::vector<PWSTR> m_kptrs, m_vptrs;
+
+	DNS_SERVICE_INSTANCE m_instance = {};
+	DNS_SERVICE_REGISTER_REQUEST m_request = {};
 	DNS_SERVICE_CANCEL m_cancel = {};
 	bool m_registered = false;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// macOS + Linux implementation — dns_sd / Bonjour / Avahi compat
+// macOS + Linux — dns_sd / Bonjour / Avahi compat
 // ─────────────────────────────────────────────────────────────────────────────
 #elif defined(__APPLE__) || defined(__linux__)
 
-// On Linux, install: sudo apt install libavahi-compat-libdnssd-dev
-// The header provides the same DNSServiceRegister API as Apple's Bonjour.
-// If not available we fall through to the stub below via the #else.
 #if defined(__APPLE__)
 #include <dns_sd.h>
 #define HAVE_DNS_SD 1
 #elif defined(__linux__)
-// Avahi ships a dns_sd compatibility header at this path
 #if __has_include(<avahi-compat-libdns_sd/dns_sd.h>)
 #include <avahi-compat-libdns_sd/dns_sd.h>
 #define HAVE_DNS_SD 1
@@ -123,7 +130,7 @@ private:
 #else
 #define HAVE_DNS_SD 0
 #endif
-#endif // __APPLE__ / __linux__
+#endif
 
 #if HAVE_DNS_SD
 
@@ -134,8 +141,6 @@ public:
 
 	bool Register(const MdnsServiceInfo &info)
 	{
-		m_info = info;
-
 		// Build TXT record wire format: <len><key=value>...
 		std::vector<uint8_t> txt;
 		for (auto &[k, v] : info.txtRecords) {
@@ -152,8 +157,8 @@ public:
 			kDNSServiceInterfaceIndexAny,
 			info.serviceName.c_str(),
 			info.serviceType.c_str(),
-			nullptr, // domain (.local)
-			nullptr, // host (local hostname)
+			nullptr,
+			nullptr,
 			htons((uint16_t)info.port),
 			(uint16_t)txt.size(),
 			txt.empty() ? nullptr : txt.data(),
@@ -179,42 +184,34 @@ private:
 			 DNSServiceErrorType, const char *, const char *,
 			 const char *, void *) {}
 
-	MdnsServiceInfo m_info;
 	DNSServiceRef m_sdRef = nullptr;
 	bool m_registered = false;
 };
 
-#else // HAVE_DNS_SD == 0 — no mDNS library available, use stub
+#else // No mDNS library — stub
 
 #include <obs-module.h>
 
 class MdnsAdvertiser {
 public:
-	MdnsAdvertiser() = default;
-	~MdnsAdvertiser() = default;
-
 	bool Register(const MdnsServiceInfo &)
 	{
 		blog(LOG_WARNING,
-		     "[obs-companion-bridge] mDNS unavailable on this "
-		     "Linux build (install libavahi-compat-libdnssd-dev). "
+		     "[obs-companion-bridge] mDNS unavailable (install "
+		     "libavahi-compat-libdnssd-dev). "
 		     "Companion will need manual IP configuration.");
 		return false;
 	}
-
 	void Unregister() {}
 };
 
 #endif // HAVE_DNS_SD
 
 #else
-// ─────────────────────────────────────────────────────────────────────────────
-// Unknown platform — no-op stub so the plugin still compiles
-// ─────────────────────────────────────────────────────────────────────────────
+// Unknown platform — no-op stub
 class MdnsAdvertiser {
 public:
 	bool Register(const MdnsServiceInfo &) { return false; }
 	void Unregister() {}
 };
-
-#endif // platform
+#endif
