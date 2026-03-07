@@ -1,167 +1,275 @@
 #pragma once
 /*
- * http-server.hpp — POSIX socket implementation for macOS/Linux.
- * Replaces the WinSock2 version used on Windows.
+ * http-server.hpp — minimal single-threaded HTTP/1.1 server
+ *
+ * Platform routing:
+ *   Windows → WinSock2 (ws2_32.lib, already linked in CMakeLists)
+ *   macOS/Linux → POSIX BSD sockets
  */
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
 
 #include <string>
 #include <unordered_map>
 #include <functional>
 #include <thread>
 #include <atomic>
-#include <mutex>
-#include <sstream>
+#include <vector>
+
+// ─── Platform socket includes ─────────────────────────────────────────────────
+#if defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET socket_t;
+static const socket_t INVALID_SOCK = INVALID_SOCKET;
+#else
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+typedef int socket_t;
+static const socket_t INVALID_SOCK = -1;
+#endif
+
+// ─── Portable close / error helpers ──────────────────────────────────────────
+#if defined(_WIN32)
+static inline int sock_close(socket_t s) { return closesocket(s); }
+static inline int sock_error() { return WSAGetLastError(); }
+#else
+static inline int sock_close(socket_t s) { return close(s); }
+static inline int sock_error() { return errno; }
+#endif
 
 struct HttpRequest {
-	std::string method, path, body, remoteAddr;
+	std::string method;
+	std::string path;
 	std::unordered_map<std::string, std::string> headers;
+	std::string body;
 };
+
 struct HttpResponse {
 	int status = 200;
-	std::string body;
 	std::unordered_map<std::string, std::string> headers;
+	std::string body;
 };
-using RouteHandler = std::function<void(const HttpRequest &, HttpResponse &)>;
+
+using HttpHandler =
+	std::function<void(const HttpRequest &, HttpResponse &)>;
 
 class HttpServer {
 public:
 	explicit HttpServer(int port) : m_port(port) {}
+
 	~HttpServer() { Stop(); }
 
-	void AddRoute(const std::string &method, const std::string &path, RouteHandler h)
+	void AddRoute(const std::string &method, const std::string &path,
+		      HttpHandler handler)
 	{
-		std::lock_guard<std::mutex> lock(m_routesMutex);
-		m_routes[method + ":" + path] = h;
+		m_routes.push_back({method, path, std::move(handler)});
 	}
 
 	bool Start()
 	{
-		m_listenFd = socket(AF_INET, SOCK_STREAM, 0);
-		if (m_listenFd < 0) return false;
+#if defined(_WIN32)
+		WSADATA wsa;
+		if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+			return false;
+#endif
+		m_serverSock = socket(AF_INET, SOCK_STREAM, 0);
+		if (m_serverSock == INVALID_SOCK)
+			return false;
 
 		int opt = 1;
-		setsockopt(m_listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#if defined(_WIN32)
+		setsockopt(m_serverSock, SOL_SOCKET, SO_REUSEADDR,
+			   (const char *)&opt, sizeof(opt));
+#else
+		setsockopt(m_serverSock, SOL_SOCKET, SO_REUSEADDR, &opt,
+			   sizeof(opt));
+#endif
 
-		sockaddr_in addr{};
+		struct sockaddr_in addr = {};
 		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = INADDR_ANY;
+		addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 		addr.sin_port = htons((uint16_t)m_port);
 
-		if (bind(m_listenFd, (sockaddr *)&addr, sizeof(addr)) < 0) return false;
-		if (listen(m_listenFd, SOMAXCONN) < 0) return false;
+		if (bind(m_serverSock, (struct sockaddr *)&addr,
+			 sizeof(addr)) < 0) {
+			sock_close(m_serverSock);
+			m_serverSock = INVALID_SOCK;
+			return false;
+		}
+
+		if (listen(m_serverSock, 10) < 0) {
+			sock_close(m_serverSock);
+			m_serverSock = INVALID_SOCK;
+			return false;
+		}
 
 		m_running = true;
-		m_acceptThread = std::thread([this]() { AcceptLoop(); });
+		m_acceptThread =
+			std::thread([this]() { AcceptLoop(); });
 		return true;
 	}
 
 	void Stop()
 	{
 		m_running = false;
-		if (m_listenFd >= 0) { close(m_listenFd); m_listenFd = -1; }
-		if (m_acceptThread.joinable()) m_acceptThread.join();
+		if (m_serverSock != INVALID_SOCK) {
+			sock_close(m_serverSock);
+			m_serverSock = INVALID_SOCK;
+		}
+		if (m_acceptThread.joinable())
+			m_acceptThread.join();
+#if defined(_WIN32)
+		WSACleanup();
+#endif
 	}
 
 private:
+	struct Route {
+		std::string method;
+		std::string path;
+		HttpHandler handler;
+	};
+
 	void AcceptLoop()
 	{
 		while (m_running) {
-			sockaddr_in ca{};
-			socklen_t al = sizeof(ca);
-			int cs = accept(m_listenFd, (sockaddr *)&ca, &al);
-			if (cs < 0) break;
-			char ip[INET_ADDRSTRLEN];
-			inet_ntop(AF_INET, &ca.sin_addr, ip, sizeof(ip));
-			std::thread([this, cs, ip = std::string(ip)]() {
-				HandleConnection(cs, ip);
-			}).detach();
+			struct sockaddr_in clientAddr = {};
+#if defined(_WIN32)
+			int addrLen = sizeof(clientAddr);
+#else
+			socklen_t addrLen = sizeof(clientAddr);
+#endif
+			socket_t clientSock =
+				accept(m_serverSock,
+				       (struct sockaddr *)&clientAddr,
+				       &addrLen);
+			if (clientSock == INVALID_SOCK)
+				continue;
+			HandleClient(clientSock);
 		}
 	}
 
-	void HandleConnection(int fd, const std::string &remoteAddr)
+	void HandleClient(socket_t sock)
 	{
-		struct timeval tv{ .tv_sec = 2, .tv_usec = 0 };
-		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
+		// Read request (simplified — no chunked encoding)
 		std::string raw;
 		char buf[4096];
-		ssize_t r;
-		while ((r = recv(fd, buf, sizeof(buf) - 1, 0)) > 0) {
-			buf[r] = '\0';
+		while (true) {
+#if defined(_WIN32)
+			int n = recv(sock, buf, sizeof(buf) - 1, 0);
+#else
+			ssize_t n = recv(sock, buf, sizeof(buf) - 1, 0);
+#endif
+			if (n <= 0)
+				break;
+			buf[n] = '\0';
 			raw += buf;
-			if (raw.find("\r\n\r\n") != std::string::npos) break;
+			// Stop when we have full headers (and for POST, a body)
+			if (raw.find("\r\n\r\n") != std::string::npos)
+				break;
 		}
 
-		HttpRequest req;
+		HttpRequest req = ParseRequest(raw);
 		HttpResponse res;
-		req.remoteAddr = remoteAddr;
 
-		if (!ParseRequest(raw, req)) { SendResponse(fd, 400, {}, "Bad Request"); close(fd); return; }
-
-		res.headers["Access-Control-Allow-Origin"] = "*";
-		res.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS";
-
-		if (req.method == "OPTIONS") { res.status = 204; } else { DispatchRoute(req, res); }
-		SendResponse(fd, res.status, res.headers, res.body);
-		close(fd);
-	}
-
-	bool ParseRequest(const std::string &raw, HttpRequest &req)
-	{
-		if (raw.empty()) return false;
-		size_t fl = raw.find("\r\n");
-		if (fl == std::string::npos) return false;
-		std::string line = raw.substr(0, fl);
-		size_t s1 = line.find(' '), s2 = line.rfind(' ');
-		if (s1 == std::string::npos || s2 == s1) return false;
-		req.method = line.substr(0, s1);
-		req.path = line.substr(s1 + 1, s2 - s1 - 1);
-		size_t q = req.path.find('?');
-		if (q != std::string::npos) req.path = req.path.substr(0, q);
-		size_t bs = raw.find("\r\n\r\n");
-		if (bs != std::string::npos) {
-			std::string hs = raw.substr(fl + 2, bs - fl - 2);
-			std::istringstream ss(hs);
-			std::string hl;
-			while (std::getline(ss, hl)) {
-				if (!hl.empty() && hl.back() == '\r') hl.pop_back();
-				size_t c = hl.find(':');
-				if (c != std::string::npos) req.headers[hl.substr(0, c)] = hl.substr(c + 2);
+		bool matched = false;
+		for (auto &route : m_routes) {
+			if (route.method == req.method &&
+			    route.path == req.path) {
+				route.handler(req, res);
+				matched = true;
+				break;
 			}
-			req.body = raw.substr(bs + 4);
 		}
-		return true;
+
+		if (!matched) {
+			res.status = 404;
+			res.body = R"({"error":"not found"})";
+			res.headers["Content-Type"] = "application/json";
+		}
+
+		SendResponse(sock, res);
+		sock_close(sock);
 	}
 
-	void DispatchRoute(const HttpRequest &req, HttpResponse &res)
+	static HttpRequest ParseRequest(const std::string &raw)
 	{
-		std::lock_guard<std::mutex> lock(m_routesMutex);
-		auto it = m_routes.find(req.method + ":" + req.path);
-		if (it != m_routes.end()) { it->second(req, res); }
-		else { res.status = 404; res.headers["Content-Type"] = "application/json"; res.body = R"({"error":"not found"})"; }
+		HttpRequest req;
+		size_t lineEnd = raw.find("\r\n");
+		if (lineEnd == std::string::npos)
+			return req;
+
+		std::string requestLine = raw.substr(0, lineEnd);
+		size_t sp1 = requestLine.find(' ');
+		size_t sp2 = requestLine.find(' ', sp1 + 1);
+		if (sp1 == std::string::npos || sp2 == std::string::npos)
+			return req;
+
+		req.method = requestLine.substr(0, sp1);
+		req.path = requestLine.substr(sp1 + 1, sp2 - sp1 - 1);
+
+		size_t pos = lineEnd + 2;
+		while (pos < raw.size()) {
+			size_t end = raw.find("\r\n", pos);
+			if (end == std::string::npos || end == pos)
+				break;
+			std::string header = raw.substr(pos, end - pos);
+			size_t colon = header.find(':');
+			if (colon != std::string::npos) {
+				std::string key = header.substr(0, colon);
+				std::string val = header.substr(colon + 1);
+				while (!val.empty() && val[0] == ' ')
+					val = val.substr(1);
+				req.headers[key] = val;
+			}
+			pos = end + 2;
+		}
+
+		size_t bodyStart = raw.find("\r\n\r\n");
+		if (bodyStart != std::string::npos)
+			req.body = raw.substr(bodyStart + 4);
+
+		return req;
 	}
 
-	void SendResponse(int fd, int status,
-			  const std::unordered_map<std::string, std::string> &headers,
-			  const std::string &body)
+	static void SendResponse(socket_t sock, const HttpResponse &res)
 	{
-		std::string st = status == 200 ? "OK" : status == 204 ? "No Content" :
-				 status == 400 ? "Bad Request" : status == 404 ? "Not Found" : "Error";
-		std::string r = "HTTP/1.1 " + std::to_string(status) + " " + st + "\r\n";
-		r += "Content-Length: " + std::to_string(body.size()) + "\r\nConnection: close\r\n";
-		for (auto &[k, v] : headers) r += k + ": " + v + "\r\n";
-		r += "\r\n" + body;
-		send(fd, r.c_str(), r.size(), 0);
+		std::string statusText = "OK";
+		if (res.status == 400)
+			statusText = "Bad Request";
+		else if (res.status == 404)
+			statusText = "Not Found";
+		else if (res.status == 500)
+			statusText = "Internal Server Error";
+
+		std::string response = "HTTP/1.1 " +
+				       std::to_string(res.status) + " " +
+				       statusText + "\r\n";
+		response += "Content-Length: " +
+			    std::to_string(res.body.size()) + "\r\n";
+		response += "Connection: close\r\n";
+		response += "Access-Control-Allow-Origin: *\r\n";
+
+		for (auto &[k, v] : res.headers)
+			response += k + ": " + v + "\r\n";
+
+		response += "\r\n";
+		response += res.body;
+
+		send(sock, response.c_str(), (int)response.size(), 0);
 	}
 
 	int m_port;
-	int m_listenFd = -1;
+	socket_t m_serverSock = INVALID_SOCK;
 	std::atomic<bool> m_running{false};
 	std::thread m_acceptThread;
-	std::unordered_map<std::string, RouteHandler> m_routes;
-	std::mutex m_routesMutex;
+	std::vector<Route> m_routes;
 };
