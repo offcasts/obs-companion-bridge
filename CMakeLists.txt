@@ -71,7 +71,7 @@ endif()
 
 # ─── Platform-specific libraries ─────────────────────────────────────────────
 if(WIN32)
-  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 dnsapi)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 dnsapi shell32)
 elseif(APPLE)
   target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE
     "-framework CoreFoundation"
