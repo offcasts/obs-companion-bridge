@@ -29,13 +29,84 @@
 #elif defined(__APPLE__)
 #include <pwd.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #else
 #include <pwd.h>
 #include <unistd.h>
 #include <cstdlib>
+#include <ifaddrs.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #endif
 
 using json = nlohmann::json;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: find the best local LAN IP (non-loopback IPv4)
+// Returns "127.0.0.1" as a safe fallback.
+// ─────────────────────────────────────────────────────────────────────────────
+static std::string GetLocalLanIP()
+{
+#if defined(_WIN32)
+	char hostname[256] = {};
+	if (gethostname(hostname, sizeof(hostname)) != 0)
+		return "127.0.0.1";
+	struct addrinfo hints = {}, *res = nullptr;
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo(hostname, nullptr, &hints, &res) != 0)
+		return "127.0.0.1";
+	std::string ip = "127.0.0.1";
+	for (struct addrinfo *p = res; p; p = p->ai_next) {
+		auto *sa = reinterpret_cast<struct sockaddr_in *>(p->ai_addr);
+		char buf[INET_ADDRSTRLEN] = {};
+		if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) {
+			std::string candidate = buf;
+			// Prefer 192.168.x.x or 10.x.x.x or 172.16-31.x.x
+			if (candidate.rfind("192.168.", 0) == 0 ||
+			    candidate.rfind("10.", 0) == 0 ||
+			    candidate.rfind("172.", 0) == 0) {
+				ip = candidate;
+				break;
+			}
+		}
+	}
+	freeaddrinfo(res);
+	return ip;
+#elif defined(__APPLE__) || defined(__linux__)
+	struct ifaddrs *ifaddr = nullptr;
+	if (getifaddrs(&ifaddr) == -1)
+		return "127.0.0.1";
+	std::string ip = "127.0.0.1";
+	for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+			continue;
+		auto *sa = reinterpret_cast<struct sockaddr_in *>(ifa->ifa_addr);
+		char buf[INET_ADDRSTRLEN] = {};
+		if (inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf))) {
+			std::string candidate = buf;
+			if (candidate == "127.0.0.1")
+				continue;
+			// Prefer private ranges
+			if (candidate.rfind("192.168.", 0) == 0 ||
+			    candidate.rfind("10.", 0) == 0 ||
+			    candidate.rfind("172.", 0) == 0) {
+				ip = candidate;
+				break;
+			}
+			// Any non-loopback as fallback
+			if (ip == "127.0.0.1")
+				ip = candidate;
+		}
+	}
+	freeifaddrs(ifaddr);
+	return ip;
+#else
+	return "127.0.0.1";
+#endif
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers: read OBS global.ini directly (used when frontend API unavailable)
@@ -361,7 +432,7 @@ void CompanionBridge::ReadWebSocketSettings()
 	std::lock_guard<std::mutex> lock(m_credentialsMutex);
 
 	// Sensible defaults
-	m_credentials.host = "127.0.0.1";
+	m_credentials.host = GetLocalLanIP();
 	m_credentials.port = 4455;
 	m_credentials.authEnabled = false;
 	m_credentials.password = "";
